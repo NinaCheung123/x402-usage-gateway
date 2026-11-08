@@ -1,0 +1,25 @@
+{
+  "id": "my-seller",
+  "name": "My AI API",
+  "payTo": "REPLACE_WITH_SOLANA_WALLET_ADDRESS",
+  "provider": { "type": "simulated" },
+  "rateCard": {
+    "models": {
+      "my-model": {
+        "input": "500000",
+        "cachedInput": "100000",
+        "output": "2000000",
+        "providerInput": "250000",
+        "providerCachedInput": "50000",
+        "providerOutput": "1000000",
+        "maxOutputTokens": 2000
+      }
+    },
+    "peak": { "startHourUtc": 14, "endHourUtc": 22, "bps": 15000 },
+    "tiers": [
+      { "name": "growth", "minTokens": 5000, "bps": 8000 },
+      { "name": "starter", "minTokens": 0, "bps": 10000 }
+    ],
+    "minChargeAtomic": "1000"
+  }
+}

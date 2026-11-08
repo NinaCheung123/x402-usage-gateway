@@ -1,0 +1,22 @@
+{
+  "id": "my-claude-reseller",
+  "name": "My Claude API",
+  "payTo": "REPLACE_WITH_SOLANA_WALLET_ADDRESS",
+  "provider": { "type": "anthropic" },
+  "rateCard": {
+    "models": {
+      "claude-opus-5-5": {
+        "input": "6000000",
+        "cachedInput": "300000",
+        "output": "30000000",
+        "providerInput": "4000000",
+        "providerCachedInput": "200000",
+        "providerOutput": "20000000",
+        "maxOutputTokens": 8000
+      }
+    },
+    "peak": { "startHourUtc": 0, "endHourUtc": 0, "bps": 10000 },
+    "tiers": [{ "name": "standard", "minTokens": 0, "bps": 10000 }],
+    "minChargeAtomic": "3000"
+  }
+}

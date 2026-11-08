@@ -1,0 +1,40 @@
+{
+  "name": "x402-usage-gateway",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "tsx --test tests/*.test.ts",
+    "setup": "tsx scripts/setup-devnet.ts && tsx scripts/setup-treasury.ts",
+    "facilitator": "tsx src/facilitator.ts",
+    "gateway": "tsx src/gateway.ts",
+    "demo": "tsx scripts/demo.ts",
+    "typecheck": "tsc --noEmit",
+    "start": "tsx scripts/start-all.ts",
+    "crash-test": "tsx scripts/crash-test.ts",
+    "start:demo": "tsx scripts/start-all.ts --demo"
+  },
+  "keywords": [],
+  "author": "Nina Cheung",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
+    "@scure/base": "^2.4.0",
+    "@solana/kit": "^8.6.0",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "@x402/core": "^2.30.0",
+    "@x402/express": "^2.30.0",
+    "@x402/fetch": "^2.30.0",
+    "@x402/svm": "^2.30.0",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
