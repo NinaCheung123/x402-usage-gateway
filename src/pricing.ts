@@ -66,15 +66,23 @@ const MILLION = 1_000_000n;
 export function validateRateCard(card: RateCard | undefined): string | null {
   if (!card || typeof card !== "object") return "rate_card is required";
   const isAmount = (v: unknown) => typeof v === "string" && /^\d{1,18}$/.test(v);
-  const models = Object.entries(card.models ?? {});
+  const isObject = (v: unknown) => typeof v === "object" && v !== null && !Array.isArray(v);
+  if (!isObject(card.models)) return "rate_card.models needs at least one model";
+  const models = Object.entries(card.models);
   if (!models.length) return "rate_card.models needs at least one model";
   for (const [id, m] of models) {
     if (!/^[a-zA-Z0-9._-]{1,64}$/.test(id)) return `invalid model name: ${id}`;
+    if (!isObject(m)) return `${id} must be an object`;
     for (const f of ["input", "cachedInput", "output", "providerInput", "providerCachedInput", "providerOutput"] as const)
       if (!isAmount(m[f])) return `${id}.${f} must be a whole number string`;
+    // The ceiling assumes all input is uncached, so that must be the higher price.
+    if (BigInt(m.cachedInput) > BigInt(m.input)) return `${id}.cachedInput can't be above ${id}.input`;
     if (!Number.isInteger(m.maxOutputTokens) || m.maxOutputTokens < 1 || m.maxOutputTokens > 128_000)
       return `${id}.maxOutputTokens must be 1 to 128000`;
   }
+  if (!isObject(card.peak)) return "rate_card.peak hours must run from 0 to 24, start before end";
+  if (!Array.isArray(card.tiers)) return "rate_card.tiers needs at least one tier";
+  for (const t of card.tiers) if (!isObject(t)) return "each tier needs a name, minTokens and bps";
   const { startHourUtc: s, endHourUtc: e, bps } = card.peak ?? ({} as RateCard["peak"]);
   if (![s, e].every((h) => Number.isInteger(h) && h >= 0 && h <= 24) || s > e)
     return "rate_card.peak hours must run from 0 to 24, start before end";

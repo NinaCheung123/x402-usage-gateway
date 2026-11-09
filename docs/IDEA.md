@@ -2,9 +2,11 @@
 
 ## In one sentence / 一句话
 
-**English:** An AI agent with no account can pay for an AI API and is charged only for what it actually used. Any seller can join with a wallet, a price list and a model, and doesn't have to build usage billing.
+**English:** An AI agent with no account can pay for an AI API, with a hard cap on what it can spend, and is charged for the usage the seller's model reports. Any seller can join with a wallet, a price list and a model, and doesn't have to build usage billing.
 
-**中文：** AI agent 不用注册账号，就能付费调用 AI API，并且只为实际用量付费。任何卖方只需提供钱包、价目表和模型即可接入，不必自己开发用量计费系统。
+**中文：** AI agent 不用注册账号，就能付费调用 AI API。支出有硬性上限，并按卖方模型报告的用量收费。任何卖方只需提供钱包、价目表和模型即可接入，不必自己开发用量计费系统。
+
+**What's new here / 这个项目新增了什么:** x402 already provides locking a maximum, settling less and batching. This project adds pricing, seller onboarding, a ledger, failure handling and recovery. x402 已经提供锁定上限、按更低金额结算和批量结算；本项目在此之上增加了定价、卖方接入、账本、失败处理和恢复功能。
 
 ## The problem / 要解决的问题
 
@@ -34,11 +36,11 @@
 
 **English:**
 - **Per call, for strangers:** the hotel deposit above. Solana enforces the limit on every call, so the agent doesn't have to trust the seller. Each call takes about 4 seconds and pays network fees.
-- **Batch, for regulars:** like a bar tab. The agent deposits once, then calls freely, with a median of about 190 ms and no on-chain payment per call. The seller claims the running total in batches, and the agent gets the unused deposit back. The agent has to trust the operator for what it deposits, so it chooses whom to trust and caps the amount.
+- **Batch, for regulars:** like a bar tab. The agent deposits once, then calls freely, with a median of a few hundred milliseconds and no on-chain payment per call. The seller claims the running total in batches, and the agent gets the unused deposit back. The agent has to trust the operator for what it deposits, so it chooses whom to trust and caps the amount.
 
 **中文：**
 - **按次付款，适合陌生调用方：** 就是上面的酒店押金。Solana 在每次调用时强制执行上限，agent 不必信任卖方。每次调用约 4 秒，并要支付网络费。
-- **批量付款，适合常客：** 就像酒吧记账。agent 只存一次押金，之后可以直接调用，中位耗时约 190 毫秒，每次调用都不需要链上付款。卖方分批领取累计金额，未用完的押金退回 agent。agent 需要在押金范围内信任运营方，所以由它决定信任谁，并设置金额上限。
+- **批量付款，适合常客：** 就像酒吧记账。agent 只存一次押金，之后可以直接调用，中位耗时约几百毫秒，每次调用都不需要链上付款。卖方分批领取累计金额，未用完的押金退回 agent。agent 需要在押金范围内信任运营方，所以由它决定信任谁，并设置金额上限。
 
 ## How a seller joins / 卖方如何接入
 
@@ -64,10 +66,10 @@
 | Agent's money can't cover the maximum / agent 的资金不够支付上限 | The call doesn't start. The agent shortens the request or picks a cheaper model. 调用不会开始，agent 可以缩短请求或换便宜模型。 |
 | Provider returns more than allowed / 模型输出超过上限 | Charge stops at the ceiling. The seller absorbs the extra and the ledger shows it. 收费停在上限，超出部分由卖方承担并记入账本。 |
 | Payment lands but can't be confirmed / 付款到账但无法确认 | Agent collects the answer later and is charged once. agent 之后可领取答案，只收费一次。 |
-| Gateway crashes while owed money / 网关崩溃时尚有未领取款项 | Seller is still paid in full after restart. 重启后卖方仍能全额收款。 |
+| Gateway crashes while owed money / 网关崩溃时尚有未领取款项 | Seller is still paid in full after restart, and used proofs stay refused. 重启后卖方仍能全额收款，已用过的凭证仍会被拒绝。 |
 | Seller's model endpoint is down / 卖方模型接口故障 | Agent isn't charged. agent 不被收费。 |
 | Model returns a blank answer / 模型返回空白答案 | Agent isn't charged. The seller's cost is recorded. agent 不被收费，卖方成本记入账本。 |
-| Agent hangs up mid-call / agent 中途断开 | The charge is still recorded correctly. 收费仍会被正确记录。 |
+| Agent hangs up mid-call / agent 中途断开 | The charge is recorded, and the agent recovers the answer for free. 收费被正确记录，agent 可以免费取回答案。 |
 | Refund fails / 退款失败 | The ledger says pending, and channel cleanup returns the funds. 账本显示待处理，通道清理会退回资金。 |
 
 **Balance running out mid-call / 调用中途余额耗尽:** this can't happen by design, because the call's maximum is reserved before work starts. 按设计不会发生，因为这次调用的上限在开始前就已预留。
@@ -84,7 +86,11 @@
 - The Claude connection has only been tested against a local stand-in, never the live API. Claude 接入只用本地替身测试过，没有调用过真实 API。
 - Records are built for one gateway server, and how the gateway itself earns money isn't built. 记录系统只适用于单台网关服务器，网关自身的收费方式也还没做。
 
-**Measured cost / 实测成本:** per-call payment pays about 20,000 lamports in network fees per call, or about $0.003 if SOL is $150 (an assumed price). Very small charges therefore need a minimum charge or batch payment, and both are built. 按次付款每次约需 20,000 lamports 网络费；假设 SOL 为 150 美元，约合 0.003 美元。因此极小额收费需要最低收费或批量付款，这两者都已实现。
+**Measured cost / 实测成本:** per-call payment pays about 20,000 lamports in network fees per call, or about $0.003 if SOL is $150 (an assumed price). Batching lowers this. The dashboard estimates these fees. 按次付款每次约需 20,000 lamports 网络费；假设 SOL 为 150 美元，约合 0.003 美元。批量付款可以降低这笔费用。后台会估算这些费用。
+
+**Business model / 商业模式:** sellers run the gateway themselves and pay their own network fees, so no middleman holds the money. A hosted version for many sellers would need a subscription or monthly invoice, which isn't built. 卖方自己运行网关并承担网络费，因此没有中间方经手资金。如果要做面向多个卖方的托管版本，需要订阅费或按月开票，这一点还没做。
+
+**What the chain can't prove / 链上无法证明的事:** Solana enforces the spending cap, but it can't see whether a seller counted tokens honestly. Solana 会强制执行支出上限，但无法判断卖方是否如实统计 token。
 
 ## How this relates to the PayPal project / 与 PayPal 项目的关系
 

@@ -38,7 +38,10 @@ async function stop(code: number) {
     if (child.exitCode !== null) continue;
     child.kill("SIGTERM");
     await new Promise((r) => {
-      const timer = setTimeout(r, 15_000);
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL"); // Never leave a service behind holding its port.
+        r(undefined);
+      }, 15_000);
       child.once("exit", () => {
         clearTimeout(timer);
         r(undefined);
@@ -47,6 +50,10 @@ async function stop(code: number) {
   }
   process.exit(code);
 }
+// Last resort if this process is stopped mid-shutdown.
+process.on("exit", () => {
+  for (const child of children.values()) if (child.exitCode === null) child.kill("SIGKILL");
+});
 process.on("SIGINT", () => void stop(0));
 process.on("SIGTERM", () => void stop(0));
 

@@ -38,8 +38,10 @@ export interface Entry {
   delivered?: "full" | "truncated" | "none";
   tx?: string;
   reason?: string;
-  /** Held only when settlement is unconfirmed, so the caller can still collect it. */
+  /** Kept briefly, so a caller whose response was lost can collect it without paying again. */
   answer?: unknown;
+  /** Hash of the payment proof, which lets its holder recover the answer. */
+  proofHash?: string;
 }
 
 const earned = (e: Entry) => e.status === "settled" || e.status === "metered";
@@ -78,6 +80,17 @@ export class Ledger {
 
   get = (id: string) => this.entries.get(id);
 
+  findByProof(proofHash: string) {
+    for (const e of this.entries.values()) if (e.proofHash === proofHash) return e;
+    return undefined;
+  }
+
+  /** Answers are customer data, so they're only kept long enough to recover. */
+  forgetAnswersBefore(cutoff: number) {
+    for (const e of this.entries.values())
+      if (e.answer !== undefined && e.status !== "pending" && Date.parse(e.at) < cutoff) this.update(e.id, { answer: undefined });
+  }
+
   all = () => [...this.entries.values()].sort((a, b) => b.at.localeCompare(a.at));
 
   /** AI tokens this seller has billed the wallet; decides its tier. */
@@ -88,6 +101,12 @@ export class Ledger {
       n += e.usage.inputTokens + e.usage.cachedInputTokens + e.usage.outputTokens;
     }
     return n;
+  }
+
+  /** Calls whose lock reached the chain, so they paid network fees either way. */
+  perCallsOnChain(sellerId?: string) {
+    const onChain: Status[] = ["settled", "refunded", "refund_pending", "settle_failed"];
+    return this.all().filter((e) => e.scheme === "upto" && onChain.includes(e.status) && (!sellerId || e.sellerId === sellerId)).length;
   }
 
   stats(sellerId?: string) {

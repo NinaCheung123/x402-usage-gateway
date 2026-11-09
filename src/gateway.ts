@@ -21,9 +21,10 @@ import { BatchChannelManager, BatchSvmScheme } from "@x402/svm/batch-settlement/
 import { UptoSvmScheme } from "@x402/svm/upto/server";
 import "dotenv/config";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { dashboardHtml } from "./dashboard.js";
-import { DurableChannelStore } from "./durable.js";
+import { BATCH_CHANNEL_TX, feeAssumptions, networkCostAtomic, PER_CALL_TX } from "./costs.js";
+import { DurableChannelStore, DurableOperationStore, TransactionCounter } from "./durable.js";
 import { Ledger, type Entry, type Scheme } from "./ledger.js";
 import { DEMO_RATE_CARD, maxCharge, priceUsage } from "./pricing.js";
 import { providerFor, ProviderError, requireText, type Failure } from "./provider.js";
@@ -55,11 +56,14 @@ if (!sellers.get("atlas")) {
 
 const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR_URL });
 const channelStore = new DurableChannelStore(`${DATA}/gateway-channels.json`);
+const batchTransactions = new TransactionCounter(`${DATA}/batch-transactions.json`);
 const batchScheme = new BatchSvmScheme({
   withdrawDelay: 900,
   receiverAuthorizer: receiverAuthorizerSigner,
   operator,
   store: channelStore,
+  // Without this, a restart forgets used proofs and they can be charged again.
+  operationStore: new DurableOperationStore(`${DATA}/gateway-operations.jsonl`),
 });
 
 const decodePayer = (header?: string): string | undefined => {
@@ -74,6 +78,8 @@ const decodePayer = (header?: string): string | undefined => {
     return undefined;
   }
 };
+const proofOf = (req: Request) => req.header("payment-signature") ?? req.header("x-payment");
+const hashProof = (proof: string) => createHash("sha256").update(proof).digest("hex");
 const payerOf = (req: Request) => decodePayer(req.header("payment-signature") ?? req.header("x-payment"));
 const sellerFromPath = (path: string) => {
   try {
@@ -110,6 +116,7 @@ async function startRedemption(seller: Seller) {
   const note = (kindName: string, tx: string, vouchers?: number) => {
     recentClaims.unshift({ at: new Date().toISOString(), payTo, kind: kindName, tx, vouchers });
     recentClaims.length = Math.min(recentClaims.length, 30);
+    batchTransactions.add(payTo);
     console.log(`[redeem ${payTo.slice(0, 6)}] ${kindName} ${vouchers ?? ""} tx=${tx}`);
   };
   // Built directly: createChannelManager always uses the whole store.
@@ -179,7 +186,7 @@ function explainPaymentFailure(reason?: string) {
     case "duplicate_settlement":
       return {
         error: "payment_proof_reused",
-        message: "This payment proof was already used. Request a new 402 and pay again.",
+        message: "This payment proof was already used, so you weren't charged again. If you lost the answer, POST this proof to /v1/recover. Otherwise request a new 402 and pay again.",
       };
     case "invalid_upto_svm_settlement_simulation":
     case "invalid_batch_settlement_svm_settlement_simulation":
@@ -247,10 +254,10 @@ function recordCallResult(res: Response, id: string, s: ReturnType<typeof readSe
       status: "pending",
       tx: s.transaction,
       reason: "Sent, awaiting confirmation",
-      answer: res.locals.answer,
     });
   }
-  ledger.update(id, { status: "settle_failed", reason: s.errorMessage ?? s.errorReason ?? "settlement failed" });
+  // Nothing was charged, so the answer must not be collectable for free.
+  ledger.update(id, { status: "settle_failed", reason: s.errorMessage ?? s.errorReason ?? "settlement failed", answer: undefined });
 }
 
 /**
@@ -304,9 +311,11 @@ const trackPayment = (req: Request, res: Response, next: NextFunction) => {
 
 /** A Solana transaction's blockhash expires in minutes, so this is long enough. */
 const PENDING_LIMIT_MS = 5 * 60 * 1000;
+const ANSWER_RETENTION_MS = Number(process.env.ANSWER_RETENTION_HOURS ?? 24) * 60 * 60 * 1000;
 
 /** Resolve pending entries from the chain, so the ledger matches reality. */
 async function reconcilePending() {
+  ledger.forgetAnswersBefore(Date.now() - ANSWER_RETENTION_MS);
   const open = ledger.all().filter((e) => e.status === "pending");
   const isOld = (e: Entry) => Date.now() - Date.parse(e.at) > PENDING_LIMIT_MS;
   // No transaction means the outcome was lost, for example in a crash. The
@@ -441,17 +450,6 @@ const generate = (scheme: Scheme) => async (req: Request, res: Response) => {
     const charge = price.chargeAtomic > authorized ? authorized : price.chargeAtomic;
     const unbilled = price.chargeAtomic - charge;
 
-    ledger.put({
-      ...base,
-      usage: out.usage,
-      tier: price.tier,
-      period: price.period,
-      lines: price.lines,
-      chargeAtomic: charge.toString(),
-      providerCostAtomic: price.providerCostAtomic.toString(),
-      delivered: out.delivered,
-      ...(unbilled > 0n ? { unbilledAtomic: unbilled.toString() } : {}),
-    });
     const answer = {
       text: out.text,
       usage_record: {
@@ -466,11 +464,27 @@ const generate = (scheme: Scheme) => async (req: Request, res: Response) => {
         lines: price.lines,
         authorized_atomic: authorized.toString(),
         charged_atomic: charge.toString(),
-        returned_atomic: (authorized - charge).toString(),
+        // Per call, the rest really goes back. In a batch, it just stays in the deposit.
+        ...(scheme === "upto"
+          ? { returned_atomic: (authorized - charge).toString() }
+          : { unspent_authorization_atomic: (authorized - charge).toString() }),
         receipt_url: `/v1/receipts/${id}`,
       },
     };
-    res.locals.answer = answer;
+    const proof = proofOf(req);
+    ledger.put({
+      ...base,
+      usage: out.usage,
+      tier: price.tier,
+      period: price.period,
+      lines: price.lines,
+      chargeAtomic: charge.toString(),
+      providerCostAtomic: price.providerCostAtomic.toString(),
+      delivered: out.delivered,
+      answer,
+      ...(proof ? { proofHash: hashProof(proof) } : {}),
+      ...(unbilled > 0n ? { unbilledAtomic: unbilled.toString() } : {}),
+    });
     setSettlementOverrides(res, { amount: charge.toString() });
     res.json(answer);
   } catch (e) {
@@ -537,7 +551,7 @@ app.get("/s/:seller/pricing", requireSeller, (_req, res) => {
   });
 });
 
-const publicEntry = ({ answer: _answer, ...e }: Entry) => e;
+const publicEntry = ({ answer: _answer, proofHash: _proofHash, ...e }: Entry) => e;
 
 app.get("/v1/receipts/:id", (req, res) => {
   const entry = ledger.get(req.params.id);
@@ -545,18 +559,28 @@ app.get("/v1/receipts/:id", (req, res) => {
   res.json(publicEntry(entry));
 });
 
-/**
- * Collect an answer that was withheld because settlement looked unconfirmed.
- * The id is unguessable and only the paying caller was given it. The answer is
- * released only once the chain shows the charge landed.
- */
-app.get("/v1/receipts/:id/answer", (req, res) => {
-  const entry = ledger.get(req.params.id);
+const isPaid = (e: Entry) => e.status === "settled" || e.status === "metered";
+
+function sendAnswer(res: Response, entry: Entry | undefined) {
   if (!entry) return void res.status(404).json({ error: "not_found" });
   if (entry.status === "pending")
     return void res.status(202).json({ status: "pending", message: "Still waiting for the chain. Try again shortly." });
-  if (entry.status === "settled" && entry.answer) return void res.json(entry.answer);
-  res.status(410).json({ status: entry.status, message: "No answer is held for this receipt." });
+  if (isPaid(entry) && entry.answer) return void res.json(entry.answer);
+  res.status(410).json({ status: entry.status, message: "No answer is held for this receipt. It may have expired, or no charge landed." });
+}
+
+/** Collect an answer by receipt. The id is unguessable and only the caller was given it. */
+app.get("/v1/receipts/:id/answer", (req, res) => sendAnswer(res, ledger.get(req.params.id)));
+
+/**
+ * Collect an answer after losing the response, when the caller has no receipt.
+ * The proof is the caller's own signature, which only it and the gateway hold.
+ * This never runs the model or charges anything.
+ */
+app.post("/v1/recover", (req, res) => {
+  const proof = proofOf(req);
+  if (!proof) return void res.status(400).json({ error: "invalid_request", message: "Send the payment proof in the payment-signature header." });
+  sendAnswer(res, ledger.findByProof(hashProof(proof)));
 });
 
 const isLoopback = (req: Request) =>
@@ -639,8 +663,24 @@ app.get("/api/stats", requireLocalOrAdmin, async (req, res) => {
   const unclaimed = channels
     .filter((c) => !seller || c.receiver === seller.payTo)
     .reduce((t, c) => t + (c.signedMaxClaimable > c.settled ? c.signedMaxClaimable - c.settled : 0n), 0n);
+  const stats = ledger.stats(seller?.id);
+  // Batch transactions belong to a wallet, so sellers sharing one share this count.
+  const walletChannels = channels.filter((c) => !seller || c.receiver === seller.payTo);
+  const batchTx = walletChannels.length * BATCH_CHANNEL_TX + (seller ? batchTransactions.get(seller.payTo) : batchTransactions.total());
+  const perCallTx = ledger.perCallsOnChain(seller?.id) * PER_CALL_TX;
+  const assumptions = feeAssumptions();
+  const perCallFee = networkCostAtomic(perCallTx, assumptions);
+  const batchFee = networkCostAtomic(batchTx, assumptions);
+  const fees = perCallFee + batchFee;
   res.json({
-    ...ledger.stats(seller?.id),
+    ...stats,
+    network: {
+      assumptions,
+      feesAtomic: fees.toString(),
+      marginAfterModelAndNetworkAtomic: (BigInt(stats.marginAtomic) - fees).toString(),
+      upto: { transactions: perCallTx, feesAtomic: perCallFee.toString() },
+      "batch-settlement": { transactions: batchTx, channels: walletChannels.length, feesAtomic: batchFee.toString() },
+    },
     unclaimedAtomic: unclaimed.toString(),
     walletAtomic: seller ? await walletBalance(seller.payTo).catch(() => null) : null,
     recent,
@@ -659,8 +699,12 @@ app.listen(PORT, process.env.GATEWAY_HOST ?? "127.0.0.1", () => {
 });
 
 async function shutdown() {
-  // Claim what's owed before stopping, so nothing earned waits on the next start.
-  await Promise.allSettled([...managers.values()].map((m) => m.stop({ flush: true })));
+  // Try to claim what's owed before stopping, but don't hang on a slow or missing
+  // facilitator: unclaimed vouchers are on disk, so the next start claims them.
+  await Promise.race([
+    Promise.allSettled([...managers.values()].map((m) => m.stop({ flush: true }))),
+    new Promise((r) => setTimeout(r, 10_000)),
+  ]);
   process.exit(0);
 }
 process.on("SIGINT", () => void shutdown());

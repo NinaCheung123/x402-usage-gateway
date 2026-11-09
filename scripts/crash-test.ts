@@ -37,6 +37,8 @@ const balance = async (o: string) =>
   (await getAccount(conn, getAssociatedTokenAddressSync(MINT, new PublicKey(o)))).amount;
 const JSON_HEADERS = { "content-type": "application/json" };
 
+class StopEarly extends Error {}
+
 let failed = 0;
 const check = (label: string, ok: boolean, detail = "") => {
   console.log(`   ${ok ? "PASS" : "FAIL"}  ${label}${detail ? `  (${detail})` : ""}`);
@@ -86,20 +88,32 @@ try {
     },
   } as never);
   const spend = { allowedAssets: [{ network: NETWORK, asset: MINT.toBase58(), maxAmountPerPayment: "1000000" }] };
-  const batchPay = wrapFetchWithPayment(fetch, new x402Client().register("solana:*", batch).setSpendControls(spend));
+  const batchProofs: string[] = [];
+  const recordingFetch: typeof fetch = async (input, init) => {
+    const req = new Request(input, init);
+    const proof = req.headers.get("payment-signature");
+    if (proof) batchProofs.push(proof);
+    return fetch(req);
+  };
+  const batchPay = wrapFetchWithPayment(recordingFetch, new x402Client().register("solana:*", batch).setSpendControls(spend));
 
   const before = { seller: await balance(seller), agent: await balance(agent) };
   let total = 0n;
+  let lastBody = "";
   for (let i = 0; i < 4; i++) {
-    const r = await batchPay(`${GATEWAY}/s/atlas/batch/generate`, {
-      method: "POST",
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ model: "atlas-fast", prompt: `crash test ${Date.now()} ${i}`, max_output_tokens: 300 }),
-    });
+    lastBody = JSON.stringify({ model: "atlas-fast", prompt: `crash test ${Date.now()} ${i}`, max_output_tokens: 300 });
+    const r = await batchPay(`${GATEWAY}/s/atlas/batch/generate`, { method: "POST", headers: JSON_HEADERS, body: lastBody });
     const b = (await r.json()) as { usage_record: { charged_atomic: string } };
     total += BigInt(b.usage_record.charged_atomic);
   }
   console.log(`   4 metered calls, ${total} atomic units owed to the seller`);
+
+  const usedProof = batchProofs[batchProofs.length - 1]!;
+  const replayProof = () =>
+    fetch(`${GATEWAY}/s/atlas/batch/generate`, { method: "POST", headers: { ...JSON_HEADERS, "payment-signature": usedProof }, body: lastBody });
+  const before402 = await replayProof();
+  check("a used proof is refused before the crash", before402.status === 402, `status ${before402.status}`);
+  await before402.text();
 
   const stats = (await (await fetch(`${GATEWAY}/api/stats?seller=atlas`)).json()) as { unclaimedAtomic: string };
   check("gateway holds unclaimed vouchers at the moment of the crash", BigInt(stats.unclaimedAtomic) > 0n, `${stats.unclaimedAtomic} unclaimed`);
@@ -111,6 +125,12 @@ try {
 
   procs.gateway = start("gateway", "src/gateway.ts");
   await untilUp(`${GATEWAY}/s/atlas/pricing`);
+  const after = await replayProof();
+  const afterText = await after.text();
+  check("the same used proof is still refused after the restart", after.status === 402 && afterText.includes("payment_proof_reused"), `status ${after.status} ${afterText.slice(0, 60)}`);
+  const recovered = await fetch(`${GATEWAY}/v1/recover`, { method: "POST", headers: { "payment-signature": usedProof } });
+  const recoveredBody = (await recovered.json()) as { text?: string };
+  check("its answer can still be recovered after the restart, for free", recovered.status === 200 && !!recoveredBody.text, `status ${recovered.status}`);
   console.log("   new gateway started; waiting for it to claim");
 
   let paid = 0n;
@@ -127,11 +147,27 @@ try {
   const net = before.agent - (await balance(agent));
   check("on-chain: agent's net cost equals the charges exactly", net === total, `${net}`);
 
+  if (process.argv.includes("--part1")) throw new StopEarly();
+
   console.log("\n── Part 2: a refund fails, then the facilitator crashes");
   const perCallPay = wrapFetchWithPayment(
     fetch,
     new x402Client().register("solana:*", new UptoSvmScheme(agentSigner, { rpcUrl: RPC } as never)).setSpendControls(spend),
   );
+  const perCallProofs: string[] = [];
+  const perCallBody = JSON.stringify({ model: "atlas-fast", prompt: `replay test ${Date.now()}`, max_output_tokens: 300 });
+  const paidOnce = await wrapFetchWithPayment(
+    async (input, init) => {
+      const req = new Request(input, init);
+      const proof = req.headers.get("payment-signature");
+      if (proof) perCallProofs.push(proof);
+      return fetch(req);
+    },
+    new x402Client().register("solana:*", new UptoSvmScheme(agentSigner, { rpcUrl: RPC } as never)).setSpendControls(spend),
+  )(`${GATEWAY}/s/atlas/generate`, { method: "POST", headers: JSON_HEADERS, body: perCallBody });
+  await paidOnce.text();
+  await sleep(8000);
+
   const agentBefore = await balance(agent);
   const sellerBefore = await balance(seller);
   await fetch(`${FACILITATOR}/test/fail-next-refund`, { method: "POST" });
@@ -153,6 +189,13 @@ try {
   console.log("   facilitator force-killed with that channel open");
   procs.facilitator = start("facilitator", "src/facilitator.ts");
   await untilUp(`${FACILITATOR}/supported`);
+  const perCallReplay = await fetch(`${GATEWAY}/s/atlas/generate`, {
+    method: "POST",
+    headers: { ...JSON_HEADERS, "payment-signature": perCallProofs[perCallProofs.length - 1]! },
+    body: perCallBody,
+  });
+  const perCallReplayText = await perCallReplay.text();
+  check("a used per-call proof is refused after the facilitator restarts", perCallReplay.status === 402, `status ${perCallReplay.status} ${perCallReplayText.slice(0, 60)}`);
   console.log("   new facilitator started; waiting for cleanup to return the funds (up to 8 minutes)");
 
   let back = await balance(agent);
@@ -163,12 +206,15 @@ try {
   check("on-chain: agent got its locked funds back", back === agentBefore, `${agentBefore - back} still locked`);
   check("on-chain: seller received nothing", (await balance(seller)) === sellerBefore);
 } catch (e) {
-  failed++;
-  console.error("   FAIL ", e instanceof Error ? e.message : e);
+  if (!(e instanceof StopEarly)) {
+    failed++;
+    console.error("   FAIL ", e instanceof Error ? e.message : e);
+  }
 } finally {
   for (const child of [procs.gateway, procs.facilitator, procs.rpc]) {
     child?.kill("SIGTERM");
     await Promise.race([stopped(child!), sleep(15_000)]);
+    child?.kill("SIGKILL"); // No effect if it has already stopped.
   }
 }
 

@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "start": "tsx scripts/start-all.ts",
     "crash-test": "tsx scripts/crash-test.ts",
-    "start:demo": "tsx scripts/start-all.ts --demo"
+    "start:demo": "tsx scripts/start-all.ts --demo",
+    "add-seller": "tsx scripts/add-seller.ts"
   },
   "keywords": [],
   "author": "Nina Cheung",

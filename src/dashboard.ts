@@ -26,7 +26,8 @@ a{color:var(--accent)}.empty{color:var(--muted);padding:16px}
 <h2>By payment method</h2><div class="wrap" id="schemes"></div>
 <h2>Batch claims on-chain</h2><div class="wrap" id="claims"></div>
 <h2>Recent calls</h2><div class="wrap" id="recent"></div>
-<p class="note">Amounts are in test tokens. "Locked" is the most a call could have cost; "Charged" is what it actually cost. "Metered" calls are paid when the seller next claims its batch. Updates every 3 seconds.</p>
+<p class="note">Amounts are in test tokens. "Locked" is the most a call could have cost; "Charged" is what it actually cost. "Metered" calls are paid when the seller next claims its batch. Usage is what the model source reported. Updates every 3 seconds.</p>
+<p class="note" id="assume"></p>
 </main><script>
 const t=a=>(Number(a||0)/1e6).toFixed(6);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -35,7 +36,7 @@ const txLink=x=>x?'<a target="_blank" rel="noopener" href="https://explorer.sola
 const LABEL={settled:"Settled",metered:"Metered",refunded:"Refunded",pending:"Pending",rejected:"Rejected",settle_failed:"Settle failed",refund_pending:"Refund pending",needs_review:"Needs review"};
 const SCHEME={"upto":"Per call","batch-settlement":"Batch"};
 const pick=document.getElementById("seller");let list=[];
-const table=(rows,empty)=>rows.length?'<table><tr><th>Name</th><th class="n">Calls</th><th class="n">Revenue</th><th class="n">Model cost</th><th class="n">Margin</th></tr>'+rows.map(([k,v])=>'<tr><td>'+esc(SCHEME[k]||k)+'</td><td class="n">'+v.calls+'</td><td class="n">'+t(v.revenue)+'</td><td class="n">'+t(v.cost)+'</td><td class="n">'+t(v.margin)+'</td></tr>').join("")+'</table>':'<div class="empty">'+empty+'</div>';
+const table=(rows,empty)=>rows.length?'<table><tr><th>Name</th><th class="n">Calls</th><th class="n">Revenue</th><th class="n">Model cost</th><th class="n">Margin after model cost</th></tr>'+rows.map(([k,v])=>'<tr><td>'+esc(SCHEME[k]||k)+'</td><td class="n">'+v.calls+'</td><td class="n">'+t(v.revenue)+'</td><td class="n">'+t(v.cost)+'</td><td class="n">'+t(v.margin)+'</td></tr>').join("")+'</table>':'<div class="empty">'+empty+'</div>';
 async function sellers(){
   list=await (await fetch("/api/sellers")).json();
   const cur=pick.value;
@@ -48,10 +49,12 @@ async function load(){
   const s=list.find(x=>x.id===pick.value);
   document.getElementById("sub").textContent=(s?"Wallet "+s.payTo+" · source: "+s.provider+" · ":"")+"Solana devnet · test token, not USDC";
   const c=d.counts||{};
-  const tiles=[["Revenue",t(d.revenueAtomic)],["Model cost",t(d.modelCostAtomic)],["Margin",t(d.marginAtomic)],...(d.walletAtomic!=null?[["Wallet on-chain",t(d.walletAtomic)]]:[]),["Metered, not yet claimed",t(d.unclaimedAtomic)],["Paid calls",(c.settled||0)+(c.metered||0)],["Refunded calls",c.refunded||0],["Rejected payments",c.rejected||0],["Unbilled overrun",t(d.unbilledAtomic)]];
+  const tiles=[["Revenue",t(d.revenueAtomic)],["Model cost",t(d.modelCostAtomic)],["Margin after model cost",t(d.marginAtomic)],["Network fees (estimate)",t(d.network.feesAtomic)],["Margin after model and network (estimate)",t(d.network.marginAfterModelAndNetworkAtomic)],...(d.walletAtomic!=null?[["Wallet on-chain",t(d.walletAtomic)]]:[]),["Metered, not yet claimed",t(d.unclaimedAtomic)],["Paid calls",(c.settled||0)+(c.metered||0)],["Refunded calls",c.refunded||0],["Rejected payments",c.rejected||0],["Unbilled overrun",t(d.unbilledAtomic)]];
   document.getElementById("tiles").innerHTML=tiles.map(([k,v])=>'<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>').join("");
   document.getElementById("models").innerHTML=table(Object.entries(d.byModel||{}),"No paid calls yet.");
-  document.getElementById("schemes").innerHTML=table(Object.entries(d.byScheme||{}),"No paid calls yet.");
+  const sch=Object.entries(d.byScheme||{});
+  document.getElementById("schemes").innerHTML=sch.length?'<table><tr><th>Name</th><th class="n">Calls</th><th class="n">Revenue</th><th class="n">Model cost</th><th class="n">Transactions</th><th class="n">Network fees (estimate)</th><th class="n">Fees per call (estimate)</th></tr>'+sch.map(([k,v])=>{const n=d.network[k]||{transactions:0,feesAtomic:"0"};return '<tr><td>'+esc(SCHEME[k]||k)+'</td><td class="n">'+v.calls+'</td><td class="n">'+t(v.revenue)+'</td><td class="n">'+t(v.cost)+'</td><td class="n">'+n.transactions+'</td><td class="n">'+t(n.feesAtomic)+'</td><td class="n">'+t(Number(n.feesAtomic)/Math.max(v.calls,1))+'</td></tr>'}).join("")+'</table>':'<div class="empty">No paid calls yet.</div>';
+  const a=d.network.assumptions;document.getElementById("assume").textContent="Network fees are an estimate: "+a.lamportsPerTx.toLocaleString()+" lamports per transaction and 1 SOL = "+a.solPriceTokens+" payment tokens. Change these with ASSUMED_LAMPORTS_PER_TX and ASSUMED_SOL_PRICE. Refundable account rent and infrastructure aren't included.";
   const cl=d.claims||[];
   document.getElementById("claims").innerHTML=cl.length?'<table><tr><th>Time</th><th>Wallet</th><th>Step</th><th>Transaction</th></tr>'+cl.map(x=>'<tr><td>'+esc(new Date(x.at).toLocaleTimeString())+'</td><td>'+short(x.payTo)+'</td><td>'+esc(x.kind)+'</td><td>'+txLink(x.tx)+'</td></tr>').join("")+'</table>':'<div class="empty">No batch claims since the gateway started.</div>';
   const r=d.recent||[];

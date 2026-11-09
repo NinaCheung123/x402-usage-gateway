@@ -211,8 +211,11 @@ app.listen(PORT, process.env.FACILITATOR_HOST ?? "127.0.0.1", () => {
 });
 
 async function shutdown() {
-  await uptoCleanup.stop();
-  await batchCleanup.stop();
+  // Channel records are on disk, so cleanup can carry on after the next start.
+  await Promise.race([
+    Promise.allSettled([uptoCleanup.stop(), batchCleanup.stop()]),
+    new Promise((r) => setTimeout(r, 10_000)),
+  ]);
   process.exit(0);
 }
 process.on("SIGINT", () => void shutdown());

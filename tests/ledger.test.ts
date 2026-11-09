@@ -53,3 +53,16 @@ test("each seller's numbers and tiers are its own", () => {
   assert.equal(ledger.tokensBilled("x", "p"), 20);
   assert.equal(ledger.tokensBilled("z", "p"), 0);
 });
+
+test("a lost answer can be found by its proof, and is forgotten after the retention period", () => {
+  const ledger = new Ledger(join(dir, "answers.jsonl"));
+  ledger.put(entry({ id: "old", proofHash: "h1", answer: { text: "x" }, at: "2026-01-01T00:00:00Z" }));
+  ledger.put(entry({ id: "new", proofHash: "h2", answer: { text: "y" }, at: "2026-11-08T00:00:00Z" }));
+  ledger.put(entry({ id: "waiting", status: "pending", answer: { text: "z" }, at: "2026-01-01T00:00:00Z" }));
+  assert.equal(ledger.findByProof("h2")?.id, "new");
+  assert.equal(ledger.findByProof("nope"), undefined);
+  ledger.forgetAnswersBefore(Date.parse("2026-06-01T00:00:00Z"));
+  assert.equal(ledger.get("old")?.answer, undefined);
+  assert.deepEqual(ledger.get("new")?.answer, { text: "y" });
+  assert.deepEqual(ledger.get("waiting")?.answer, { text: "z" });
+});

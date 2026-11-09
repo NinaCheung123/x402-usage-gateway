@@ -94,3 +94,31 @@ test("rate cards are validated", () => {
   assert.ok(validateRateCard({ ...CARD, peak: { startHourUtc: 22, endHourUtc: 14, bps: 15_000 } }));
   assert.ok(validateRateCard({ ...CARD, tiers: [{ name: "x", minTokens: 100, bps: 10_000 }] }));
 });
+
+test("a cached price above the input price is refused, since the ceiling would be too low", () => {
+  const card = structuredClone(CARD);
+  card.models["atlas-fast"]!.cachedInput = "100000000";
+  assert.match(validateRateCard(card) ?? "", /cachedInput/);
+  card.models["atlas-fast"]!.cachedInput = card.models["atlas-fast"]!.input;
+  assert.equal(validateRateCard(card), null);
+});
+
+test("any valid card's ceiling covers the worst mix of token types", () => {
+  const worst = priceUsage(CARD, "atlas-pro", { inputTokens: 50, cachedInputTokens: 50, outputTokens: 500 }, { at: PEAK, tokensBilled: 0 });
+  assert.ok(worst.chargeAtomic <= maxCharge(CARD, "atlas-pro", "x".repeat(300), 500));
+});
+
+test("malformed rate cards get a clear message rather than a crash", () => {
+  const broken: unknown[] = [
+    { ...CARD, models: { "atlas-fast": null } },
+    { ...CARD, models: { "atlas-fast": "free" } },
+    { ...CARD, models: null },
+    { ...CARD, models: [] },
+    { ...CARD, peak: null },
+    { ...CARD, tiers: "none" },
+    { ...CARD, tiers: [null] },
+    null,
+    "card",
+  ];
+  for (const card of broken) assert.equal(typeof validateRateCard(card as never), "string");
+});

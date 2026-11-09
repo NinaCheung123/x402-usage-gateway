@@ -4,9 +4,24 @@
  * behaviour and write a JSON snapshot after each change. One process per file:
  * this suits a single gateway, and a larger deployment should use a database.
  */
-import type { ChannelState, ChannelStore } from "@x402/svm/batch-settlement/server";
+import type {
+  BatchOperation,
+  BatchOperationStore,
+  ChannelState,
+  ChannelStore,
+} from "@x402/svm/batch-settlement/server";
 import { MemoryChannelStore } from "@x402/svm/batch-settlement/server";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
 // JSON has no bigint, and channel amounts are bigints.
@@ -97,4 +112,90 @@ export class DurableChannelStore implements ChannelStore {
     await this.persist();
     return result;
   }
+}
+
+/**
+ * Every batch request ID the gateway has accepted. This is what stops a used
+ * payment proof from being charged again, so it has to outlive a restart.
+ *
+ * A reservation reaches the disk before the model runs. A crash at any later
+ * point therefore leaves the request refused, not repeatable: the worst case is
+ * that the seller misses one charge, never that an agent pays twice. Entries are
+ * kept for good, because a proof stays valid while its channel does.
+ */
+export class DurableOperationStore implements BatchOperationStore {
+  private operations = new Map<string, BatchOperation>();
+  private fd: number;
+
+  constructor(path: string) {
+    mkdirSync(dirname(path), { recursive: true });
+    let endsCleanly = true;
+    if (existsSync(path)) {
+      const text = readFileSync(path, "utf8");
+      endsCleanly = !text || text.endsWith("\n");
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const op = JSON.parse(line, decode) as BatchOperation;
+          this.operations.set(this.key(op.channelId, op.requestId), op);
+        } catch {
+          console.warn(`[operations] skipped an unreadable line in ${path}`);
+        }
+      }
+    }
+    this.fd = openSync(path, "a");
+    if (!endsCleanly) writeSync(this.fd, "\n");
+  }
+
+  private key = (channelId: string, requestId: string) => `${channelId}\0${requestId}`;
+
+  /** Writes to disk first: if this fails, the request fails before any work runs. */
+  private record(op: BatchOperation) {
+    writeSync(this.fd, JSON.stringify(op, encode) + "\n");
+    fsyncSync(this.fd);
+    this.operations.set(this.key(op.channelId, op.requestId), op);
+  }
+
+  async get(channelId: string, requestId: string) {
+    return this.operations.get(this.key(channelId, requestId));
+  }
+
+  async reserve(channelId: string, requestId: string, ceiling: bigint) {
+    const existing = this.operations.get(this.key(channelId, requestId));
+    if (existing) return { created: false, operation: existing };
+    const operation: BatchOperation = { status: "reserved", channelId, requestId, ceiling };
+    this.record(operation);
+    return { created: true, operation };
+  }
+
+  async complete(operation: Extract<BatchOperation, { status: "completed" }>) {
+    const existing = this.operations.get(this.key(operation.channelId, operation.requestId));
+    if (!existing || existing.status !== "reserved" || existing.ceiling !== operation.ceiling)
+      throw new Error("batch operation reservation changed");
+    this.record(operation);
+  }
+
+  /** A failed request stays recorded, so its proof can't be used again. */
+  async release(_channelId: string, _requestId: string) {}
+
+  close() {
+    closeSync(this.fd);
+  }
+}
+
+/** On-chain batch claims per wallet, which feed the network fee estimate. */
+export class TransactionCounter {
+  private counts: Record<string, number>;
+
+  constructor(private path: string) {
+    this.counts = load<Record<string, number>>(path) ?? {};
+  }
+
+  add(key: string) {
+    this.counts[key] = (this.counts[key] ?? 0) + 1;
+    save(this.path, this.counts);
+  }
+
+  get = (key: string) => this.counts[key] ?? 0;
+  total = () => Object.values(this.counts).reduce((a, b) => a + b, 0);
 }

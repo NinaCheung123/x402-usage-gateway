@@ -13,6 +13,7 @@ import { wrapFetchWithPayment } from "@x402/fetch";
 import { BatchSvmScheme } from "@x402/svm/batch-settlement/client";
 import { UptoSvmScheme } from "@x402/svm/upto/client";
 import "dotenv/config";
+import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { DEMO_RATE_CARD } from "../src/pricing.js";
 
@@ -92,13 +93,21 @@ function batchClient(signer: KeyPairSigner, trusted: string[], maxDeposit = "200
     .register("solana:*", scheme)
     .setSpendControls({ allowedAssets: [{ network: NETWORK, asset: MINT.toBase58(), maxAmountPerPayment: "1000000" }] });
   const proofs: string[] = [];
+  const race = { armed: false, statuses: [] as number[] };
   const recording: typeof fetch = async (input, init) => {
     const req = new Request(input, init);
     const proof = req.headers.get("payment-signature");
     if (proof) proofs.push(proof);
+    if (proof && race.armed) {
+      // Send the same paid request twice at once, as a retrying client might.
+      race.armed = false;
+      const both = await Promise.all([fetch(req.clone()), fetch(req.clone())]);
+      race.statuses = both.map((r) => r.status);
+      return both.find((r) => r.status === 200) ?? both[0]!;
+    }
     return fetch(req);
   };
-  return { scheme, proofs, pay: wrapFetchWithPayment(recording, client) };
+  return { scheme, proofs, race, pay: wrapFetchWithPayment(recording, client) };
 }
 
 const post = (path: string, body: unknown, f: typeof fetch = fetch, headers: Record<string, string> = {}) =>
@@ -186,9 +195,12 @@ let firstCharge = 0n;
 
 title("3b. Agent hangs up mid-call: the charge is still recorded");
 {
+  let hungUpProof = "";
   const hangUp: typeof fetch = async (input, init) => {
     const req = new Request(input, init);
-    if (!req.headers.get("payment-signature")) return fetch(req);
+    const proof = req.headers.get("payment-signature");
+    if (!proof) return fetch(req);
+    hungUpProof = proof;
     const stop = new AbortController();
     setTimeout(() => stop.abort(), 300);
     return fetch(req, { signal: stop.signal });
@@ -205,10 +217,20 @@ title("3b. Agent hangs up mid-call: the charge is still recorded");
   }).catch(() => undefined);
   const after = await waitFor((n) => n.atlas > before.atlas && before.agent - n.agent === n.atlas - before.atlas);
   const onChain = after.atlas - before.atlas;
-  await sleep(1000);
-  const { recent } = await getJson<{ recent: { status: string; chargeAtomic: string }[] }>("/api/stats?seller=atlas");
+  // The chain can show the money before the facilitator has finished confirming it.
+  let recent: { status: string; chargeAtomic: string }[] = [];
+  for (const deadline = Date.now() + 60_000; Date.now() < deadline; await sleep(2000)) {
+    ({ recent } = await getJson<{ recent: typeof recent }>("/api/stats?seller=atlas"));
+    if (recent[0]?.status !== "pending") break;
+  }
   check("on-chain: the charge landed", onChain > 0n, tokens(onChain));
   check("ledger shows it as settled for the same amount", recent[0]?.status === "settled" && BigInt(recent[0].chargeAtomic) === onChain, recent[0]?.status);
+  const recovered = await fetch(`${GATEWAY}/v1/recover`, { method: "POST", headers: { "payment-signature": hungUpProof } });
+  const recoveredBody = (await recovered.json()) as { text?: string };
+  check("agent recovers the lost answer with its proof", recovered.status === 200 && !!recoveredBody.text, `status ${recovered.status}`);
+  await sleep(3000);
+  const later = await balances();
+  check("on-chain: recovering it cost nothing", later.agent === after.agent && later.atlas === after.atlas);
 }
 
 title("4. Same prompt again: cached input costs less");
@@ -352,7 +374,7 @@ title("11. Payment lands but can't be confirmed: answer isn't lost, no double ch
 
 title("12. Repeat caller: one deposit, many fast calls, nothing on-chain per call");
 {
-  const { pay: batchPay, scheme, proofs: batchProofs } = batchClient(agent, [operator]);
+  const { pay: batchPay, scheme, proofs: batchProofs, race } = batchClient(agent, [operator]);
   const before = await balances();
   const solBefore = await conn.getBalance(new PublicKey(facilitatorWallet));
   let total = 0n;
@@ -371,6 +393,11 @@ title("12. Repeat caller: one deposit, many fast calls, nothing on-chain per cal
   console.log(`   first call ${times[0]} ms (opens the channel); next 9 median ${median} ms`);
   console.log(`   10 calls charged ${tokens(total)} tokens in total`);
   check("calls 2 to 10 don't touch the agent's wallet: no on-chain payment per call", (await balance(agent.address)) === agentAfterOpen);
+
+  race.armed = true;
+  const raced = await usageOf(await post("/s/atlas/batch/generate", { model: "atlas-fast", prompt: `${prompt} batch race`, max_output_tokens: 300 }, batchPay));
+  total += BigInt(raced.charged_atomic);
+  check("the same request sent twice at once runs once", [...race.statuses].sort().join() === "200,402", race.statuses.join(" and "));
 
   const failing = await post("/s/atlas/batch/generate", { model: "atlas-fast", prompt, max_output_tokens: 300, simulate_failure: "provider_error" }, batchPay);
   check("provider failure inside a batch isn't charged", failing.status === 502, `status ${failing.status}`);
@@ -462,6 +489,15 @@ title("14. New seller onboards through the API, with its own wallet and prices")
   check("seller's minimum charge covers network fees on tiny calls", tiny.charged_atomic === "1000", tiny.charged_atomic);
   await sleep(3000);
 
+  // The guided setup a seller would really use, then a real payment to it.
+  const setup = spawnSync(process.execPath, ["--import", "tsx", "scripts/add-seller.ts", "--id", "guided", "--name", "Guided Seller (demo)", "--wallet", novaWallet, "--model", "guided-model", "--input", "1", "--output", "4", "--cost-input", "0.5", "--cost-output", "2", "--min", "0.001", "--no-prompt"], { encoding: "utf8", env: process.env });
+  check("guided seller setup finishes", setup.status === 0, setup.status === 0 ? "" : setup.stderr.slice(0, 160));
+  const guidedBefore = await balances();
+  const g = await usageOf(await post("/s/guided/generate", { model: "guided-model", prompt: `${prompt} guided`, max_output_tokens: 100 }, pay));
+  const guidedAfter = await settledTo(guidedBefore, BigInt(g.charged_atomic), "nova");
+  check("on-chain: that seller gets paid straight away", guidedAfter.nova - guidedBefore.nova === BigInt(g.charged_atomic), tokens(g.charged_atomic));
+  await sleep(3000);
+
   const batchNova = batchClient(agent, [operator]);
   const novaBefore = await balances();
   const m = await usageOf(await post("/s/nova/batch/generate", { model: "nova-mini", prompt: `${prompt} nova batch`, max_output_tokens: 100 }, batchNova.pay));
@@ -534,6 +570,17 @@ title("16. Heavy use moves the agent to a cheaper tier");
 
 title("Seller's view");
 {
+  interface NetworkView { transactions: number; feesAtomic: string }
+  const a = await getJson<{
+    marginAtomic: string;
+    byScheme: Record<string, { calls: number }>;
+    network: { feesAtomic: string; marginAfterModelAndNetworkAtomic: string; upto: NetworkView; "batch-settlement": NetworkView };
+  }>("/api/stats?seller=atlas");
+  const perCall = Number(a.network.upto.feesAtomic) / a.byScheme.upto!.calls;
+  const perBatchCall = Number(a.network["batch-settlement"].feesAtomic) / a.byScheme["batch-settlement"]!.calls;
+  console.log(`   estimated network fees per call: per-call ${tokens(BigInt(Math.ceil(perCall)))}, batch ${tokens(BigInt(Math.ceil(perBatchCall)))}`);
+  check("the margin after network fees subtracts them exactly", BigInt(a.marginAtomic) - BigInt(a.network.feesAtomic) === BigInt(a.network.marginAfterModelAndNetworkAtomic));
+  check("batch costs less in network fees per call than paying per call", perBatchCall < perCall, `${Math.ceil(perBatchCall)} vs ${Math.ceil(perCall)} atomic`);
   const s = await getJson<{ revenueAtomic: string; modelCostAtomic: string; marginAtomic: string; counts: Record<string, number> }>("/api/stats");
   console.log(`   all sellers: revenue ${tokens(s.revenueAtomic)}  model cost ${tokens(s.modelCostAtomic)}  margin ${tokens(s.marginAtomic)}`);
   console.log(`   calls: ${JSON.stringify(s.counts)}`);
