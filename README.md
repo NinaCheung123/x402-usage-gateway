@@ -108,7 +108,7 @@ Run the unit tests with:
 npm test
 ```
 
-To reset the numbers, stop the services and delete `data/ledger.jsonl`. Keep the other files in `data/`: they hold open channels and unclaimed seller money.
+To reset the numbers, first check that the dashboard shows nothing metered and unclaimed, because these files track money sellers haven't collected yet. Then stop the services and delete `ledger.jsonl`, `gateway-channels.json`, `batch-transactions.json` and `gateway-operations.jsonl` from `data/` together. Deleting only the ledger makes batch fees per call look too high, because channels from earlier runs still count. Keep the other files in `data/`.
 
 ## What's tested
 
