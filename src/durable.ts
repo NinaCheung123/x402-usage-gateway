@@ -119,9 +119,9 @@ export class DurableChannelStore implements ChannelStore {
  * payment proof from being charged again, so it has to outlive a restart.
  *
  * A reservation reaches the disk before the model runs. A crash at any later
- * point therefore leaves the request refused, not repeatable: the worst case is
- * that the seller misses one charge, never that an agent pays twice. Entries are
- * kept for good, because a proof stays valid while its channel does.
+ * point therefore leaves the request refused, not repeatable, so an agent can't
+ * pay twice. `src/interrupted.ts` then settles what's left of that call. Entries
+ * are kept for good, because a proof stays valid while its channel does.
  */
 export class DurableOperationStore implements BatchOperationStore {
   private operations = new Map<string, BatchOperation>();

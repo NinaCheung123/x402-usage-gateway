@@ -16,7 +16,7 @@ select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid 
 .wrap{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:10px}
 table{border-collapse:collapse;width:100%;font-size:13.5px}th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
 tr:last-child td{border-bottom:0}th{color:var(--muted);font-weight:500}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
-.s{font-weight:600}.settled,.metered{color:var(--good)}.refunded,.pending,.refund_pending{color:var(--warn)}.rejected,.settle_failed,.needs_review{color:var(--bad)}
+.s{font-weight:600}.settled,.metered{color:var(--good)}.refunded,.pending,.refund_pending{color:var(--warn)}.rejected,.settle_failed,.needs_review,.interrupted{color:var(--bad)}
 a{color:var(--accent)}.empty{color:var(--muted);padding:16px}
 </style></head><body><main>
 <header><div><h1>Usage Gateway</h1><p class="sub" id="sub"></p></div>
@@ -25,6 +25,7 @@ a{color:var(--accent)}.empty{color:var(--muted);padding:16px}
 <h2>By model</h2><div class="wrap" id="models"></div>
 <h2>By payment method</h2><div class="wrap" id="schemes"></div>
 <h2>Batch claims on-chain</h2><div class="wrap" id="claims"></div>
+<h2>Interrupted calls</h2><div class="wrap" id="attention"></div>
 <h2>Recent calls</h2><div class="wrap" id="recent"></div>
 <p class="note">Amounts are in test tokens. "Locked" is the most a call could have cost; "Charged" is what it actually cost. "Metered" calls are paid when the seller next claims its batch. Usage is what the model source reported. Updates every 3 seconds.</p>
 <p class="note" id="assume"></p>
@@ -33,7 +34,7 @@ const t=a=>(Number(a||0)/1e6).toFixed(6);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const short=s=>s?esc(s.slice(0,4)+"…"+s.slice(-4)):"–";
 const txLink=x=>x?'<a target="_blank" rel="noopener" href="https://explorer.solana.com/tx/'+encodeURIComponent(x)+'?cluster=devnet">'+short(x)+'</a>':"–";
-const LABEL={settled:"Settled",metered:"Metered",refunded:"Refunded",pending:"Pending",rejected:"Rejected",settle_failed:"Settle failed",refund_pending:"Refund pending",needs_review:"Needs review"};
+const LABEL={settled:"Settled",metered:"Metered",refunded:"Refunded",pending:"Pending",rejected:"Rejected",settle_failed:"Settle failed",refund_pending:"Refund pending",needs_review:"Needs review",interrupted:"Interrupted"};
 const SCHEME={"upto":"Per call","batch-settlement":"Batch"};
 const pick=document.getElementById("seller");let list=[];
 const table=(rows,empty)=>rows.length?'<table><tr><th>Name</th><th class="n">Calls</th><th class="n">Revenue</th><th class="n">Model cost</th><th class="n">Margin after model cost</th></tr>'+rows.map(([k,v])=>'<tr><td>'+esc(SCHEME[k]||k)+'</td><td class="n">'+v.calls+'</td><td class="n">'+t(v.revenue)+'</td><td class="n">'+t(v.cost)+'</td><td class="n">'+t(v.margin)+'</td></tr>').join("")+'</table>':'<div class="empty">'+empty+'</div>';
@@ -57,6 +58,8 @@ async function load(){
   const a=d.network.assumptions;document.getElementById("assume").textContent="Network fees are an estimate: "+a.lamportsPerTx.toLocaleString()+" lamports per transaction and 1 SOL = "+a.solPriceTokens+" payment tokens. Change these with ASSUMED_LAMPORTS_PER_TX and ASSUMED_SOL_PRICE. Refundable account rent and infrastructure aren't included.";
   const cl=d.claims||[];
   document.getElementById("claims").innerHTML=cl.length?'<table><tr><th>Time</th><th>Wallet</th><th>Step</th><th>Transaction</th></tr>'+cl.map(x=>'<tr><td>'+esc(new Date(x.at).toLocaleTimeString())+'</td><td>'+short(x.payTo)+'</td><td>'+esc(x.kind)+'</td><td>'+txLink(x.tx)+'</td></tr>').join("")+'</table>':'<div class="empty">No batch claims since the gateway started.</div>';
+  const att=d.attention||[];
+  document.getElementById("attention").innerHTML=att.length?'<table><tr><th>Time</th><th>Status</th><th>Seller</th><th>Agent</th><th class="n">Uncollected</th><th class="n">Model cost</th><th>What to do</th></tr>'+att.map(a=>'<tr><td>'+esc(new Date(a.at).toLocaleTimeString())+'</td><td class="s '+esc(a.status)+'">'+esc(LABEL[a.status]||a.status)+'</td><td>'+esc(a.sellerId||"–")+'</td><td>'+short(a.payer)+'</td><td class="n">'+t(a.uncollectedAtomic)+'</td><td class="n">'+t(a.modelCostAtomic)+'</td><td>'+esc(a.whatToDo)+'</td></tr>').join("")+'</table>':'<div class="empty">No calls were cut off by a crash.</div>';
   const r=d.recent||[];
   document.getElementById("recent").innerHTML=r.length?'<table><tr><th>Time</th><th>Status</th><th>Seller</th><th>Method</th><th>Agent</th><th>Model</th><th>Tier</th><th>Period</th><th class="n">AI tokens</th><th class="n">Locked</th><th class="n">Charged</th><th>Transaction</th><th>Reason</th></tr>'+r.map(e=>{
     const u=e.usage||{};const n=(u.inputTokens||0)+(u.cachedInputTokens||0)+(u.outputTokens||0);

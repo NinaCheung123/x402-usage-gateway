@@ -4,6 +4,8 @@
  *
  * Part 1: force-kill the gateway while it holds unclaimed vouchers (the seller's
  * money), start a new one, and check the seller is still paid in full.
+ * Part 1b: kill the gateway at three moments inside a batch call, and check both
+ * sides are told what happened and that the money matches what was really charged.
  * Part 2: make a refund fail, force-kill the facilitator, start a new one, and
  * check the agent's locked funds still come back. Part 2 waits for channel
  * cleanup, so it takes several minutes.
@@ -146,6 +148,151 @@ try {
   await sleep(6000);
   const net = before.agent - (await balance(agent));
   check("on-chain: agent's net cost equals the charges exactly", net === total, `${net}`);
+
+  console.log("\n── Part 1b: the gateway crashes in the middle of a batch call");
+  const midProofs: string[] = [];
+  // An x402 client stays stuck on a channel once a request dies with no response,
+  // so an agent starts a new client after a crash. This test does the same.
+  const newMidClient = () => wrapFetchWithPayment(
+    async (input, init) => {
+      const req = new Request(input, init);
+      const proof = req.headers.get("payment-signature");
+      if (proof) midProofs.push(proof);
+      return fetch(req);
+    },
+    new x402Client()
+      .register("solana:*", new BatchSvmScheme(agentSigner, {
+        rpcUrl: RPC,
+        serverSignedChannelsPolicy: {
+          allowedOperators: [operator],
+          allowedAssets: [{ network: NETWORK, asset: MINT.toBase58(), maxDeposit: "200000" }],
+        },
+      } as never))
+      .setSpendControls(spend),
+  );
+  let midPay = newMidClient();
+  const midStart = { seller: await balance(seller), agent: await balance(agent) };
+  let midTotal = 0n;
+  const generateBody = (prompt: string, simulate_failure?: string) =>
+    JSON.stringify({ model: "atlas-fast", prompt, max_output_tokens: 300, ...(simulate_failure ? { simulate_failure } : {}) });
+  const paidCall = async (prompt: string) => {
+    const r = await midPay(`${GATEWAY}/s/atlas/batch/generate`, { method: "POST", headers: JSON_HEADERS, body: generateBody(prompt) });
+    const b = (await r.json()) as { usage_record: { charged_atomic: string } };
+    if (r.status !== 200) throw new Error(`a normal call failed with ${r.status}`);
+    midTotal += BigInt(b.usage_record.charged_atomic);
+  };
+  /** Sends a call that kills the gateway, then starts a new gateway. Returns its proof. */
+  const callThatCrashes = async (point: string) => {
+    const died = await midPay(`${GATEWAY}/s/atlas/batch/generate`, { method: "POST", headers: JSON_HEADERS, body: generateBody(`mid-call ${point} ${Date.now()}`, point) }).then(
+      () => false,
+      () => true,
+    );
+    check(`${point}: the gateway really died and the agent got no response`, died);
+    midPay = newMidClient();
+    await stopped(procs.gateway!);
+    procs.gateway = start("gateway", "src/gateway.ts");
+    await untilUp(`${GATEWAY}/s/atlas/pricing`);
+    return midProofs[midProofs.length - 1]!;
+  };
+  const recover = (proof: string) => fetch(`${GATEWAY}/v1/recover`, { method: "POST", headers: { "payment-signature": proof } });
+  interface Notice {
+    status?: string;
+    answer_held?: boolean;
+    charged_atomic?: string;
+    price_atomic?: string;
+    resume_url?: string;
+    receipt_url?: string;
+    text?: string;
+    usage_record?: { id: string; charged_atomic: string };
+  }
+
+  await paidCall(`mid-call opener ${Date.now()}`);
+
+  // After the answer, before the charge.
+  const heldProof = await callThatCrashes("crash_after_answer");
+  const heldRes = await recover(heldProof);
+  const held = (await heldRes.json()) as Notice;
+  check("held answer: the agent is told it wasn't charged", heldRes.status === 409 && held.status === "interrupted" && held.charged_atomic === "0", `status ${heldRes.status}`);
+  check("held answer: the agent is told the price and where to pay", held.answer_held === true && BigInt(held.price_atomic ?? "0") > 0n && !!held.resume_url, `price ${held.price_atomic}`);
+  check("held answer: it isn't given away by asking", held.text === undefined);
+  const heldRetry = await fetch(`${GATEWAY}/s/atlas/batch/generate`, { method: "POST", headers: { ...JSON_HEADERS, "payment-signature": heldProof }, body: generateBody("retry") });
+  const heldRetryBody = (await heldRetry.json()) as { interrupted?: Notice };
+  check("held answer: retrying the old proof is refused and points to the held answer", heldRetry.status === 402 && heldRetryBody.interrupted?.answer_held === true, `status ${heldRetry.status}`);
+  const statsHeld = (await (await fetch(`${GATEWAY}/api/stats?seller=atlas`)).json()) as { attention: { id: string; answerHeld: boolean; uncollectedAtomic: string }[] };
+  const heldId = held.resume_url!.split("/").at(-1)!;
+  const sellerView = statsHeld.attention.find((a) => a.id === heldId);
+  check("held answer: the seller sees the uncollected charge", sellerView?.answerHeld === true && sellerView.uncollectedAtomic === held.price_atomic, sellerView?.uncollectedAtomic);
+  const rewrites = [`/S/atlas/batch/resume/${heldId}`, `/s/atlas/BATCH/RESUME/${heldId}`, `/s/atlas/batch/resume/${heldId}/`, `/s/atlas/batch//resume/${heldId}`, `/s/%61tlas/batch/resume/${heldId}`, `/s/atlas/batch/resume/%2e/${heldId}`];
+  const rewriteStatuses: number[] = [];
+  for (const path of rewrites) {
+    const r = await fetch(GATEWAY + path, { method: "POST" });
+    rewriteStatuses.push(r.status);
+    await r.text();
+  }
+  check("held answer: rewritten paths never get it free", rewriteStatuses.every((s) => s !== 200), rewriteStatuses.join(" "));
+  const heldBalance = await balance(agent);
+  const noPay = await fetch(`${GATEWAY}${held.resume_url}`, { method: "POST" });
+  await noPay.text();
+  check("held answer: collecting it without paying gets a 402", noPay.status === 402, `status ${noPay.status}`);
+  check("held answer: asking moved no money", (await balance(agent)) === heldBalance);
+  const resumed = await midPay(`${GATEWAY}${held.resume_url}`, { method: "POST" });
+  const resumedBody = (await resumed.json()) as Notice;
+  check("held answer: paying the original price returns the answer", resumed.status === 200 && !!resumedBody.text, `status ${resumed.status}`);
+  midTotal += BigInt(held.price_atomic ?? "0");
+  await sleep(500);
+  const heldReceipt = (await (await fetch(`${GATEWAY}${held.receipt_url}`)).json()) as { status: string };
+  check("held answer: the ledger now says it was charged", heldReceipt.status === "metered", heldReceipt.status);
+  const resumeTwice = await fetch(`${GATEWAY}${held.resume_url}`, { method: "POST" });
+  await resumeTwice.text();
+  check("held answer: it can't be paid for twice", resumeTwice.status === 409, `status ${resumeTwice.status}`);
+  const heldAgain = await recover(heldProof);
+  await heldAgain.text();
+  check("held answer: if that response is lost too, it's now free to collect", heldAgain.status === 200, `status ${heldAgain.status}`);
+
+  // Before any answer exists.
+  const noAnswerProof = await callThatCrashes("crash_before_answer");
+  const noAnswerRes = await recover(noAnswerProof);
+  const noAnswer = (await noAnswerRes.json()) as Notice;
+  check("no answer: the agent is told it wasn't charged and has nothing to collect", noAnswerRes.status === 409 && noAnswer.answer_held === false && noAnswer.charged_atomic === "0", `status ${noAnswerRes.status}`);
+  const statsNone = (await (await fetch(`${GATEWAY}/api/stats?seller=atlas`)).json()) as { attention: { id: string; whatToDo: string }[] };
+  check("no answer: the seller is warned its model may have billed it", statsNone.attention.some((a) => /may still have billed/.test(a.whatToDo)));
+  await paidCall(`mid-call after crash ${Date.now()}`);
+  check("no answer: a new request works straight after", true);
+
+  // After the charge, before the ledger write.
+  const chargedProof = await callThatCrashes("crash_after_charge");
+  const chargedRes = await recover(chargedProof);
+  const charged = (await chargedRes.json()) as Notice;
+  check("already charged: the answer is free to collect", chargedRes.status === 200 && !!charged.text, `status ${chargedRes.status}`);
+  midTotal += BigInt(charged.usage_record?.charged_atomic ?? "0");
+  const chargedId = charged.usage_record?.id;
+  const chargedReceipt = (await (await fetch(`${GATEWAY}/v1/receipts/${chargedId}`)).json()) as { status: string };
+  check("already charged: the ledger caught up from the payment records", chargedReceipt.status === "metered", chargedReceipt.status);
+  const chargedResume = await fetch(`${GATEWAY}/s/atlas/batch/resume/${chargedId}`, { method: "POST" });
+  await chargedResume.text();
+  check("already charged: it can't be billed a second time", chargedResume.status === 409, `status ${chargedResume.status}`);
+
+  let midPaid = 0n;
+  for (const deadline = Date.now() + 120_000; Date.now() < deadline; ) {
+    await sleep(4000);
+    midPaid = (await balance(seller)) - midStart.seller;
+    if (midPaid === midTotal) break;
+  }
+  check("on-chain: seller received exactly what was charged", midPaid === midTotal, `${midPaid} of ${midTotal}`);
+  const midRefund = await (async () => {
+    const refundScheme = new BatchSvmScheme(agentSigner, {
+      rpcUrl: RPC,
+      serverSignedChannelsPolicy: {
+        allowedOperators: [operator],
+        allowedAssets: [{ network: NETWORK, asset: MINT.toBase58(), maxDeposit: "200000" }],
+      },
+    } as never);
+    return refundScheme.refund(`${GATEWAY}/s/atlas/channel`);
+  })();
+  check("agent closes its channel straight after the crashes", midRefund.success === true);
+  await sleep(6000);
+  const midNet = midStart.agent - (await balance(agent));
+  check("on-chain: agent's net cost equals what was charged, with no double charge", midNet === midTotal, `${midNet} of ${midTotal}`);
 
   if (process.argv.includes("--part1")) throw new StopEarly();
 

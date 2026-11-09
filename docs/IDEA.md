@@ -67,6 +67,7 @@
 | Provider returns more than allowed / 模型输出超过上限 | Charge stops at the ceiling. The seller absorbs the extra and the ledger shows it. 收费停在上限，超出部分由卖方承担并记入账本。 |
 | Payment lands but can't be confirmed / 付款到账但无法确认 | Agent collects the answer later and is charged once. agent 之后可领取答案，只收费一次。 |
 | Gateway crashes while owed money / 网关崩溃时尚有未领取款项 | Seller is still paid in full after restart, and used proofs stay refused. 重启后卖方仍能全额收款，已用过的凭证仍会被拒绝。 |
+| Gateway crashes mid-call / 调用途中网关崩溃 | Used proofs stay refused. If the answer was saved but not charged, the agent can pay the original price to collect it, or decline. If it was charged, the ledger catches up and the answer is free. Both sides are told. 已用凭证仍被拒绝。若答案已保存但未收费，agent 可按原价付款领取，也可放弃；若已收费，账本会补记，答案免费领取。双方都会收到通知。 |
 | Seller's model endpoint is down / 卖方模型接口故障 | Agent isn't charged. agent 不被收费。 |
 | Model returns a blank answer / 模型返回空白答案 | Agent isn't charged. The seller's cost is recorded. agent 不被收费，卖方成本记入账本。 |
 | Agent hangs up mid-call / agent 中途断开 | The charge is recorded, and the agent recovers the answer for free. 收费被正确记录，agent 可以免费取回答案。 |

@@ -136,12 +136,29 @@ To reset the numbers, stop the services and delete `data/ledger.jsonl`. Keep the
 
 The demo checks exact balances, so run one test at a time. Other tests using the same wallets, or an old lock being returned at startup, can make a check fail with no money lost. If that happens, run it again.
 
-`npm run crash-test` has two parts, both checked on-chain:
+`npm run crash-test` has three parts, all checked on-chain:
 
 - It force-kills the gateway while it holds unclaimed seller money and starts a new one. The seller is still paid in full, a used payment proof is still refused and not charged again, and its answer can still be recovered.
+- It force-kills the gateway at three moments inside a batch call, as described in [Crashes during a call](#crashes-during-a-call). The agent's net cost and the seller's receipts must match exactly what was charged.
 - It makes a refund fail, force-kills the facilitator and starts a new one. Channel cleanup still returns the agent's locked funds.
 
 Scenario 11 and the failed refund can't be caused on demand, so they use test switches in the facilitator. In scenario 11 the payment really lands, but the facilitator reports it as unconfirmed, which matches what public devnet rate limiting caused during development. These switches only exist in demo mode.
+
+## Crashes during a call
+
+On restart, the gateway compares its ledger with its payment records and settles every call the crash cut off. It's still impossible to charge a used proof twice.
+
+| Gateway dies | Batch call becomes | Agent | Seller |
+|---|---|---|---|
+| Before an answer is saved | Interrupted, no charge | Told it wasn't charged and to send a new request | Told its model may still have billed it |
+| After the answer, before the charge | Interrupted, answer held | Told the price, and may pay it at `resume_url` to collect the answer without the model running again, or do nothing | Shown the uncollected amount; paid if the agent collects |
+| After the charge, before the ledger | Metered, from the payment records | Collects the answer free at `/v1/recover` | Paid as normal |
+
+The agent hears this from `POST /v1/recover`, its receipt, or a retry of the same proof. The seller sees it under "Interrupted calls" on the dashboard and in `attention` from `/api/stats`.
+
+Paying is the agent's choice, because it never received the answer. Held answers expire with other stored answers, and the seller then carries the model cost.
+
+A per-call payment settles through the facilitator, so the gateway can't tell from its own records whether money moved. It's marked "Needs review", is never billed again, and both sides are told to check the chain.
 
 ## API
 
@@ -155,6 +172,7 @@ Scenario 11 and the failed refund can't be caused on demand, so they use test sw
 | `GET /v1/receipts/:id` | No | One ledger entry, with its transaction |
 | `GET /v1/receipts/:id/answer` | No | Collect a paid answer by receipt |
 | `POST /v1/recover` | No | Lost the response and have no receipt? Send your payment proof to collect the answer |
+| `POST /s/:seller/batch/resume/:id` | Batch | Pay the original price to collect an answer held after a crash. The model doesn't run again |
 | `POST /admin/sellers` | Admin token | Add a seller or update its settings |
 | `GET /` and `GET /api/stats` | This machine or admin token | Seller dashboard |
 
@@ -206,13 +224,18 @@ The public x402.org facilitator lists only `exact` on Solana devnet, so this pro
 - **One gateway instance:** durable records are JSON snapshots for a single process. Running several instances would need a real database.
 - **Agent state:** the demo agent keeps its channel records in memory. A restarted agent would need x402's durable client storage, or a forced close, to recover a deposit.
 - **Admin:** one shared token, with guided setup run by whoever holds it, and no seller self-service. Behind a reverse proxy, every caller would look local to the dashboard check, so change that check before exposing it that way.
-- **Lost outcomes:** if the gateway crashes between settling and recording a call, the ledger marks it "Needs review" rather than guessing. The chain remains the source of truth.
+- **Lost outcomes:** if the gateway crashes between settling and recording a per-call payment, the ledger marks it "Needs review" rather than guessing, and tells both sides how to check. The chain remains the source of truth.
 - **No platform fee:** sellers receive all of each charge. How the gateway itself earns money isn't built.
 - **Stored answers:** paid answers are kept for 24 hours for recovery, unencrypted in `data/ledger.jsonl`. Set `ANSWER_RETENTION_HOURS` to change this.
 - **No real service yet:** the demo's answers are simulated, so this shows the payment flow working, not a product customers want.
 - **Claude billing:** the adapter charges for all output tokens the API reports, which includes thinking as well as visible text. A seller should tell its customers so.
 - **Ceiling estimate:** the maximum uses a rough character-based token estimate, not a tokenizer. If real usage exceeds it, the agent still pays no more than the lock and the seller absorbs the rest.
-- **Crash mid-call:** a batch request whose gateway crashes after accepting it is refused if retried, so the seller may miss that charge. An agent is never charged twice.
+- **Lost responses in the x402 client:** when a batch request dies with no response, that client object refuses further payments on the channel, and x402 has no way to clear it. An agent should start a new client object, as `npm run crash-test` does.
+- **Crash mid-call:** see [Crashes during a call](#crashes-during-a-call). A seller can still lose a charge if the agent never collects a held answer, or if no answer was saved, and the agent can only learn about it by asking: the gateway has no way to contact an agent first.
+
+## Next steps
+
+- **Ask for more instead of absorbing an overrun:** stream the model's output, pause when a call reaches its lock, and let the agent approve more or stop with what it has. Until this is built, the seller absorbs anything above the lock. Not built yet.
 
 ## License
 

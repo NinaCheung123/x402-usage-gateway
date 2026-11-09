@@ -25,6 +25,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { dashboardHtml } from "./dashboard.js";
 import { BATCH_CHANNEL_TX, feeAssumptions, networkCostAtomic, PER_CALL_TX } from "./costs.js";
 import { DurableChannelStore, DurableOperationStore, TransactionCounter } from "./durable.js";
+import { agentNotice, canResume, needsAttention, operationLink, reconcile, sellerNotice } from "./interrupted.js";
 import { Ledger, type Entry, type Scheme } from "./ledger.js";
 import { DEMO_RATE_CARD, maxCharge, priceUsage } from "./pricing.js";
 import { providerFor, ProviderError, requireText, type Failure } from "./provider.js";
@@ -34,7 +35,12 @@ const NETWORK = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1" as Network;
 const PORT = Number(process.env.GATEWAY_PORT ?? 4021);
 const FACILITATOR_URL = process.env.FACILITATOR_URL ?? "http://localhost:4022";
 const DATA = process.env.DATA_DIR ?? "data";
-const FAILURES: Failure[] = ["provider_error", "truncated", "overrun"];
+const PROVIDER_FAILURES: Failure[] = ["provider_error", "truncated", "overrun"];
+/** Test switches that kill the gateway at a chosen moment. Demo mode only. */
+const CRASH_POINTS = ["crash_before_answer", "crash_after_answer", "crash_after_charge"] as const;
+type CrashPoint = (typeof CRASH_POINTS)[number];
+const FAILURES: string[] = [...PROVIDER_FAILURES, ...CRASH_POINTS];
+const crashNow = () => process.kill(process.pid, "SIGKILL");
 const MINT = process.env.TEST_MINT!;
 const RPC_URL = process.env.RPC_SHIELD_URL ?? process.env.SVM_RPC_URL!;
 /** Ceiling for the refund route, which does no metered work. */
@@ -57,14 +63,37 @@ if (!sellers.get("atlas")) {
 const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR_URL });
 const channelStore = new DurableChannelStore(`${DATA}/gateway-channels.json`);
 const batchTransactions = new TransactionCounter(`${DATA}/batch-transactions.json`);
+const operationStore = new DurableOperationStore(`${DATA}/gateway-operations.jsonl`);
 const batchScheme = new BatchSvmScheme({
   withdrawDelay: 900,
   receiverAuthorizer: receiverAuthorizerSigner,
   operator,
   store: channelStore,
   // Without this, a restart forgets used proofs and they can be charged again.
-  operationStore: new DurableOperationStore(`${DATA}/gateway-operations.jsonl`),
+  operationStore,
 });
+
+/**
+ * Runs once at startup. This is the only gateway process, so any call still open
+ * was cut off by the last crash: work out what happened to it and say so.
+ */
+async function reconcileAfterRestart() {
+  for (const e of ledger.all()) {
+    const unresolved = (e.status === "pending" && !e.tx) || (e.status === "interrupted" && e.operation);
+    if (!unresolved) continue;
+    const link = e.operation;
+    const operation = link && (await operationStore.get(link.channelId, link.requestId));
+    const channel = link && (await channelStore.get(link.channelId));
+    const change = reconcile(e, operation, channel);
+    ledger.update(e.id, change);
+    console.warn(`[restart] call ${e.id} for seller ${e.sellerId}: now ${change.status}. ${change.reason}`);
+  }
+  // Those calls will never finish, so stop them holding up refunds and new calls.
+  for (const c of await channelStore.list()) {
+    if (Object.keys(c.reservations ?? {}).length) await channelStore.update(c.channelId, (s) => ({ ...s!, reservations: {} }));
+  }
+}
+await reconcileAfterRestart();
 
 const decodePayer = (header?: string): string | undefined => {
   if (!header) return undefined;
@@ -79,6 +108,15 @@ const decodePayer = (header?: string): string | undefined => {
   }
 };
 const proofOf = (req: Request) => req.header("payment-signature") ?? req.header("x-payment");
+const linkOf = (req: Request) => {
+  const proof = proofOf(req);
+  if (!proof) return undefined;
+  try {
+    return operationLink(decodePaymentSignatureHeader(proof).payload);
+  } catch {
+    return undefined;
+  }
+};
 const hashProof = (proof: string) => createHash("sha256").update(proof).digest("hex");
 const payerOf = (req: Request) => decodePayer(req.header("payment-signature") ?? req.header("x-payment"));
 const sellerFromPath = (path: string) => {
@@ -139,7 +177,7 @@ interface GenerateBody {
   model: string;
   prompt: string;
   max_output_tokens: number;
-  simulate_failure?: Failure;
+  simulate_failure?: Failure | CrashPoint;
 }
 
 /** Returns an error message, or null if the body is valid for this seller. */
@@ -246,7 +284,11 @@ function recordCallResult(res: Response, id: string, s: ReturnType<typeof readSe
   }
   if (s.success) {
     const status = res.locals.scheme === "batch-settlement" ? "metered" : "settled";
-    return void ledger.update(id, { status, tx: s.transaction || undefined });
+    return void ledger.update(id, { status, tx: s.transaction || undefined, ...(res.locals.resuming ? { reason: undefined } : {}) });
+  }
+  // A failed attempt to collect a held answer leaves it held, so it can be tried again.
+  if (res.locals.resuming) {
+    return void ledger.update(id, { status: "interrupted", operation: undefined, reason: `Collecting the answer failed: ${s.errorMessage ?? s.errorReason ?? "settlement failed"}` });
   }
   // Sent but unconfirmed isn't failed: keep it pending, hold the answer, ask the chain.
   if (s.errorReason === "settlement_pending" && s.transaction) {
@@ -272,6 +314,7 @@ const trackPayment = (req: Request, res: Response, next: NextFunction) => {
     if (done) return end(...args);
     done = true;
     const s = readSettlement(res.getHeader("payment-response"));
+    if (res.locals.crashAfterCharge && s?.success) crashNow();
     const id = res.locals.entryId as string | undefined;
     if (id) recordCallResult(res, id, s);
 
@@ -281,6 +324,8 @@ const trackPayment = (req: Request, res: Response, next: NextFunction) => {
     if (!refused || !reason || reason === "Payment required") return end(...args);
 
     const explained = explainPaymentFailure(reason);
+    const proof = proofOf(req);
+    const original = proof ? ledger.findByProof(hashProof(proof)) : undefined;
     if (!id) {
       // Funds were never locked, or the lock wasn't confirmed: no work ran.
       ledger.put({
@@ -298,6 +343,8 @@ const trackPayment = (req: Request, res: Response, next: NextFunction) => {
     }
     const body = JSON.stringify({
       ...explained,
+      // A retry after a crash is told exactly where that call stands.
+      ...(original && needsAttention(original) ? { interrupted: agentNotice(original) } : {}),
       // An unconfirmed payment may still land, so the answer stays collectable.
       ...(id ? { receipt_url: `/v1/receipts/${id}`, answer_url: `/v1/receipts/${id}/answer` } : {}),
     });
@@ -378,8 +425,26 @@ const batchPriceFromBody = (ctx: { path: string; adapter: { getBody?(): unknown 
   return { ...price, extra: { minDeposit: (BigInt(price.amount) * DEPOSIT_CALLS).toString() } };
 };
 
+const heldAnswer = (path: string) => {
+  try {
+    return ledger.get(decodeURIComponent(path.split("/").filter(Boolean).at(-1) ?? ""));
+  } catch {
+    return undefined;
+  }
+};
+/** The original price. `requireResumable` has already refused anything else. */
+const resumePriceFromPath = (ctx: { path: string }) => {
+  const amount = heldAnswer(ctx.path)?.chargeAtomic ?? CHANNEL_ROUTE_CEILING;
+  return { amount, asset: MINT, extra: { minDeposit: (BigInt(amount) * DEPOSIT_CALLS).toString() } };
+};
+
 const payment = paymentMiddleware(
   {
+    "POST /s/*/batch/resume/*": {
+      accepts: { scheme: "batch-settlement", price: resumePriceFromPath, network: NETWORK, payTo: payToFromPath, maxTimeoutSeconds: 300 },
+      description: "Collect an answer held after a gateway crash. The model doesn't run again.",
+      mimeType: "application/json",
+    },
     // Listed first: "*" spans slashes, so the per-call pattern below also matches this path.
     "POST /s/*/batch/generate": {
       accepts: { scheme: "batch-settlement", price: batchPriceFromBody, network: NETWORK, payTo: payToFromPath, maxTimeoutSeconds: 300 },
@@ -419,6 +484,10 @@ const generate = (scheme: Scheme) => async (req: Request, res: Response) => {
   const payer = payerOf(req);
   const authorized = maxCharge(card, body.model, body.prompt, body.max_output_tokens);
   res.locals.entryId = id;
+  const proof = proofOf(req);
+  const crashAt = (point: CrashPoint) => {
+    if (body.simulate_failure === point) crashNow();
+  };
 
   const base: Entry = {
     id,
@@ -431,7 +500,12 @@ const generate = (scheme: Scheme) => async (req: Request, res: Response) => {
     authorizedAtomic: authorized.toString(),
     chargeAtomic: "0",
     providerCostAtomic: "0",
+    ...(proof ? { proofHash: hashProof(proof) } : {}),
+    ...(scheme === "batch-settlement" ? { operation: linkOf(req) } : {}),
   };
+  // Saved before the model runs, so a crash from here on can't go unnoticed.
+  ledger.put(base);
+  crashAt("crash_before_answer");
 
   try {
     const out = requireText(
@@ -439,7 +513,7 @@ const generate = (scheme: Scheme) => async (req: Request, res: Response) => {
         model: card.models[body.model]!.upstreamModel ?? body.model,
         prompt: body.prompt,
         maxOutputTokens: body.max_output_tokens,
-        failure: body.simulate_failure,
+        failure: PROVIDER_FAILURES.find((f) => f === body.simulate_failure),
       }),
     );
     const price = priceUsage(card, body.model, out.usage, {
@@ -471,7 +545,6 @@ const generate = (scheme: Scheme) => async (req: Request, res: Response) => {
         receipt_url: `/v1/receipts/${id}`,
       },
     };
-    const proof = proofOf(req);
     ledger.put({
       ...base,
       usage: out.usage,
@@ -482,9 +555,10 @@ const generate = (scheme: Scheme) => async (req: Request, res: Response) => {
       providerCostAtomic: price.providerCostAtomic.toString(),
       delivered: out.delivered,
       answer,
-      ...(proof ? { proofHash: hashProof(proof) } : {}),
       ...(unbilled > 0n ? { unbilledAtomic: unbilled.toString() } : {}),
     });
+    crashAt("crash_after_answer");
+    res.locals.crashAfterCharge = body.simulate_failure === "crash_after_charge";
     setSettlementOverrides(res, { amount: charge.toString() });
     res.json(answer);
   } catch (e) {
@@ -517,6 +591,45 @@ const mount = (scheme: Scheme) => {
 };
 app.post("/s/:seller/generate", ...mount("upto"));
 app.post("/s/:seller/batch/generate", ...mount("batch-settlement"));
+
+/** One attempt at a time, so two simultaneous requests can't both pay for one answer. */
+const resuming = new Set<string>();
+const requireResumable = (req: Request, res: Response, next: NextFunction) => {
+  const id = String(req.params.id);
+  const entry = ledger.get(id);
+  if (!entry || entry.sellerId !== (res.locals.seller as Seller).id) return void res.status(404).json({ error: "not_found" });
+  if (!canResume(entry)) {
+    return void res.status(409).json({
+      error: "nothing_to_collect",
+      message: "This call has no held answer to pay for, so you weren't charged. Check its receipt.",
+      receipt_url: `/v1/receipts/${id}`,
+    });
+  }
+  if (proofOf(req)) {
+    if (resuming.has(id)) return void res.status(409).json({ error: "already_collecting", message: "Another payment for this answer is in progress, so you weren't charged." });
+    resuming.add(id);
+    res.once("close", () => resuming.delete(id));
+  }
+  res.locals.entry = entry;
+  next();
+};
+
+/** Hands over an answer held after a crash, for the original price. The model doesn't run. */
+app.post("/s/:seller/batch/resume/:id", requireSeller, (_req, res, next) => {
+  res.locals.scheme = "batch-settlement";
+  next();
+}, requireResumable, trackPayment, payment, (req: Request, res: Response) => {
+  const entry = res.locals.entry as Entry;
+  const link = linkOf(req);
+  // Without this link, a crash here couldn't be told apart from no charge at all.
+  if (!link) return void res.status(400).json({ error: "payment_not_linkable", message: "This payment type can't collect a held answer, so you weren't charged." });
+  res.locals.entryId = entry.id;
+  res.locals.resuming = true;
+  ledger.update(entry.id, { operation: link });
+  setSettlementOverrides(res, { amount: entry.chargeAtomic });
+  res.json(entry.answer);
+});
+
 app.get("/s/:seller/channel", requireSeller, payment, (_req, res) => res.json({ ok: true }));
 
 /** Free: what a call could cost, so an agent can choose before locking funds. */
@@ -551,12 +664,12 @@ app.get("/s/:seller/pricing", requireSeller, (_req, res) => {
   });
 });
 
-const publicEntry = ({ answer: _answer, proofHash: _proofHash, ...e }: Entry) => e;
+const publicEntry = ({ answer: _answer, proofHash: _proofHash, operation: _operation, ...e }: Entry) => e;
 
 app.get("/v1/receipts/:id", (req, res) => {
   const entry = ledger.get(req.params.id);
   if (!entry) return void res.status(404).json({ error: "not_found" });
-  res.json(publicEntry(entry));
+  res.json({ ...publicEntry(entry), ...(needsAttention(entry) ? { next_step: agentNotice(entry) } : {}) });
 });
 
 const isPaid = (e: Entry) => e.status === "settled" || e.status === "metered";
@@ -565,6 +678,7 @@ function sendAnswer(res: Response, entry: Entry | undefined) {
   if (!entry) return void res.status(404).json({ error: "not_found" });
   if (entry.status === "pending")
     return void res.status(202).json({ status: "pending", message: "Still waiting for the chain. Try again shortly." });
+  if (needsAttention(entry)) return void res.status(409).json(agentNotice(entry));
   if (isPaid(entry) && entry.answer) return void res.json(entry.answer);
   res.status(410).json({ status: entry.status, message: "No answer is held for this receipt. It may have expired, or no charge landed." });
 }
@@ -658,7 +772,9 @@ app.get("/api/stats", requireLocalOrAdmin, async (req, res) => {
   const seller = sellers.get(requested);
   // An unknown id must not fall through to everyone's numbers.
   if (requested && !seller) return void res.status(404).json({ error: "unknown_seller" });
-  const recent = ledger.all().filter((e) => !seller || e.sellerId === seller.id).slice(0, 30).map(publicEntry);
+  const rows = ledger.all().filter((e) => !seller || e.sellerId === seller.id);
+  const recent = rows.slice(0, 30).map(publicEntry);
+  const attention = rows.filter(needsAttention).map(sellerNotice);
   const channels = await channelStore.list();
   const unclaimed = channels
     .filter((c) => !seller || c.receiver === seller.payTo)
@@ -684,6 +800,8 @@ app.get("/api/stats", requireLocalOrAdmin, async (req, res) => {
     unclaimedAtomic: unclaimed.toString(),
     walletAtomic: seller ? await walletBalance(seller.payTo).catch(() => null) : null,
     recent,
+    attention,
+    uncollectedAtomic: attention.reduce((t, a) => t + BigInt(a.uncollectedAtomic), 0n).toString(),
     claims: recentClaims.filter((c) => !seller || c.payTo === seller.payTo).slice(0, 10),
   });
 });

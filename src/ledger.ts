@@ -15,6 +15,7 @@ export type Status =
   | "refunded" // provider failed or delivered nothing; caller wasn't charged
   | "refund_pending" // not charged, but the refund failed; channel cleanup returns the funds
   | "needs_review" // settlement outcome lost, e.g. a crash mid-call; check the chain
+  | "interrupted" // the gateway crashed before charging; see src/interrupted.ts
   | "settle_failed" // settlement failed; seller absorbs the model cost
   | "rejected"; // payment refused before any work started
 
@@ -42,6 +43,8 @@ export interface Entry {
   answer?: unknown;
   /** Hash of the payment proof, which lets its holder recover the answer. */
   proofHash?: string;
+  /** The batch operation behind this call, which shows whether it was charged. */
+  operation?: { channelId: string; requestId: string };
 }
 
 const earned = (e: Entry) => e.status === "settled" || e.status === "metered";
